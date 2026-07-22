@@ -399,6 +399,8 @@ func (q *internalQuery) attempt(keyspace string, end, start time.Time, iter *Ite
 			Err:        iter.err,
 			Attempt:    attempt,
 			Query:      q.originalQuery,
+			BytesTx:    iter.BytesTx(),
+			BytesRx:    iter.BytesRx(),
 		})
 	}
 }
@@ -646,6 +648,8 @@ func (b *internalBatch) attempt(keyspace string, end, start time.Time, iter *Ite
 		Err:     iter.err,
 		Attempt: attempt,
 		Batch:   b.originalBatch,
+		BytesTx: iter.BytesTx(),
+		BytesRx: iter.BytesRx(),
 	})
 }
 
