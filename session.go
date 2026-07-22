@@ -1944,6 +1944,22 @@ func (iter *Iter) Warnings() []string {
 	return nil
 }
 
+// BytesTx returns the number of bytes written from the network connection.
+func (iter *Iter) BytesTx() int {
+	if iter.framer != nil {
+		return iter.framer.bytesTx
+	}
+	return 0
+}
+
+// BytesRx returns the number of bytes read from the network connection.
+func (iter *Iter) BytesRx() int {
+	if iter.framer != nil {
+		return iter.framer.bytesRx
+	}
+	return 0
+}
+
 // Close closes the iterator and returns any errors that happened during
 // the query or the iteration.
 func (iter *Iter) Close() error {
@@ -2452,6 +2468,11 @@ type ObservedQuery struct {
 
 	// Query object associated with this request. Should be used as read only.
 	Query *Query
+
+	// The number of bytes written to the network connection.
+	BytesTx int
+	// The number of bytes read from the network connection.
+	BytesRx int
 }
 
 // QueryObserver is the interface implemented by query observers / stat collectors.
@@ -2501,6 +2522,11 @@ type ObservedBatch struct {
 
 	// Batch object associated with this request. Should be used as read only.
 	Batch *Batch
+
+	// The number of bytes written to the network connection.
+	BytesTx int
+	// The number of bytes read from the network connection.
+	BytesRx int
 }
 
 // BatchObserver is the interface implemented by batch observers / stat collectors.
