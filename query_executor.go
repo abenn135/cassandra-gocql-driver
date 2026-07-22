@@ -57,8 +57,9 @@ type Statement interface {
 }
 
 type internalRequest interface {
-	execute(ctx context.Context, conn *Conn) *Iter
-	attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo)
+	execute(ctx context.Context, conn *Conn, bm *byteMetrics) *Iter
+	attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo, bm *byteMetrics)
+	hasObserver() bool
 	retryPolicy() RetryPolicy
 	speculativeExecutionPolicy() SpeculativeExecutionPolicy
 	getQueryMetrics() *queryMetrics
@@ -73,12 +74,56 @@ type queryExecutor struct {
 	policy HostSelectionPolicy
 }
 
+// byteMetrics belongs to one observer attempt, unlike queryMetrics, which is
+// shared across retries within a page. Preparation runs in its own goroutine
+// and can update it after the attempt has given up waiting for it.
+type byteMetrics struct {
+	mu sync.Mutex
+	byteCounts
+}
+
+// byteCounts holds uncompressed message body sizes; see ObservedQuery.BytesTx.
+type byteCounts struct {
+	bytesTx, bytesRx int64
+}
+
+func (m *byteMetrics) addTx(n int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.bytesTx += int64(n)
+	m.mu.Unlock()
+}
+
+func (m *byteMetrics) addRx(n int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.bytesRx += int64(n)
+	m.mu.Unlock()
+}
+
+func (m *byteMetrics) snapshot() byteCounts {
+	if m == nil {
+		return byteCounts{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.byteCounts
+}
+
 func (q *queryExecutor) attemptQuery(ctx context.Context, qry internalRequest, conn *Conn) *Iter {
+	var bm *byteMetrics
+	if qry.hasObserver() {
+		bm = &byteMetrics{}
+	}
 	start := time.Now()
-	iter := qry.execute(ctx, conn)
+	iter := qry.execute(ctx, conn, bm)
 	end := time.Now()
 
-	qry.attempt(q.pool.keyspace, end, start, iter, conn.host)
+	qry.attempt(q.pool.keyspace, end, start, iter, conn.host, bm)
 
 	return iter
 }
@@ -376,11 +421,12 @@ func (q *internalQuery) Attempts() int {
 	return q.metrics.attempts()
 }
 
-func (q *internalQuery) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
+func (q *internalQuery) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo, bm *byteMetrics) {
 	latency := end.Sub(start)
 	attempt := q.metrics.attempt(latency)
 
 	if q.qryOpts.observer != nil {
+		counts := bm.snapshot()
 		metricsForHost := q.hostMetricsManager.attempt(latency, host)
 		q.qryOpts.observer.ObserveQuery(q.qryOpts.context, ObservedQuery{
 			Keyspace:  keyspace,
@@ -399,12 +445,18 @@ func (q *internalQuery) attempt(keyspace string, end, start time.Time, iter *Ite
 			Err:        iter.err,
 			Attempt:    attempt,
 			Query:      q.originalQuery,
+			BytesTx:    counts.bytesTx,
+			BytesRx:    counts.bytesRx,
 		})
 	}
 }
 
-func (q *internalQuery) execute(ctx context.Context, conn *Conn) *Iter {
-	return conn.executeQuery(ctx, q)
+func (q *internalQuery) execute(ctx context.Context, conn *Conn, bm *byteMetrics) *Iter {
+	return conn.executeQueryWithMetrics(ctx, q, bm)
+}
+
+func (q *internalQuery) hasObserver() bool {
+	return q.qryOpts.observer != nil
 }
 
 func (q *internalQuery) retryPolicy() RetryPolicy {
@@ -606,7 +658,7 @@ func (b *internalBatch) Attempts() int {
 	return b.metrics.attempts()
 }
 
-func (b *internalBatch) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
+func (b *internalBatch) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo, bm *byteMetrics) {
 	latency := end.Sub(start)
 	attempt := b.metrics.attempt(latency)
 
@@ -615,6 +667,7 @@ func (b *internalBatch) attempt(keyspace string, end, start time.Time, iter *Ite
 	}
 
 	metricsForHost := b.hostMetricsManager.attempt(latency, host)
+	counts := bm.snapshot()
 
 	n := len(b.batchOpts.entries)
 	statements := make([]string, n)
@@ -646,6 +699,8 @@ func (b *internalBatch) attempt(keyspace string, end, start time.Time, iter *Ite
 		Err:     iter.err,
 		Attempt: attempt,
 		Batch:   b.originalBatch,
+		BytesTx: counts.bytesTx,
+		BytesRx: counts.bytesRx,
 	})
 }
 
@@ -732,6 +787,10 @@ func (b *internalBatch) getKeyspaceFunc() func() string {
 	return nil
 }
 
-func (b *internalBatch) execute(ctx context.Context, conn *Conn) *Iter {
-	return conn.executeBatch(ctx, b)
+func (b *internalBatch) execute(ctx context.Context, conn *Conn, bm *byteMetrics) *Iter {
+	return conn.executeBatchWithMetrics(ctx, b, bm)
+}
+
+func (b *internalBatch) hasObserver() bool {
+	return b.batchOpts.observer != nil
 }
