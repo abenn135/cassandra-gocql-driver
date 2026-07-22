@@ -507,6 +507,8 @@ func (q *internalQuery) recordAttempt(attemptNum int, keyspace string, end, star
 			Err:        iter.err,
 			Attempt:    attemptNum,
 			Query:      q.originalQuery,
+			BytesTx:    iter.BytesTx(),
+			BytesRx:    iter.BytesRx(),
 		})
 	}
 }
@@ -758,6 +760,8 @@ func (b *internalBatch) recordAttempt(attemptNum int, keyspace string, end, star
 		Err:     iter.err,
 		Attempt: attemptNum,
 		Batch:   b.originalBatch,
+		BytesTx: iter.BytesTx(),
+		BytesRx: iter.BytesRx(),
 	})
 }
 
