@@ -140,8 +140,13 @@ type QueryAttempt struct {
 	SpeculativeExecutionCount int
 }
 
+type QueryAttemptHandlerParams struct {
+	Context context.Context
+	Trace Tracer
+}
+
 // QueryAttemptHandler is a function that attempts query execution. The interceptor must call this once if it does not return an error.
-type QueryAttemptHandler = func(context.Context) (*Iter, error)
+type QueryAttemptHandler = func(QueryAttemptHandlerParams) (*Iter, error)
 
 // ExecAttemptInterceptor is the interface implemented by interceptors / middleware.
 //
@@ -176,8 +181,8 @@ func (c ExecAttemptInterceptorChain) getNextHandler(curr int, attempt QueryAttem
 		return final
 	}
 
-	return func(ctx context.Context) (*Iter, error) {
-		return c.Interceptors[curr+1].Intercept(ctx, attempt, c.getNextHandler(curr+1, attempt, final))
+	return func(p QueryAttemptHandlerParams) (*Iter, error) {
+		return c.Interceptors[curr+1].Intercept(p.Context, attempt, c.getNextHandler(curr+1, attempt, final))
 	}
 }
 
@@ -203,8 +208,16 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalReque
 			iq.Type = OpBatch
 			iq.Batch = &immutableBatch{batch: iBatch.originalBatch}
 		}
-		iter, err = q.interceptor.Intercept(ctx, iq, func(cxCtx context.Context) (*Iter, error) {
-			it := iRequest.execute(cxCtx, conn)
+		iter, err = q.interceptor.Intercept(ctx, iq, func(p QueryAttemptHandlerParams) (*Iter, error) {
+			if p.Trace != nil {
+				switch iRequest.(type) {
+				case *internalQuery:
+					iRequest.(*internalQuery).qryOpts.trace = p.Trace
+				case *internalBatch:
+					iRequest.(*internalBatch).batchOpts.trace = p.Trace
+				}
+			}
+			it := iRequest.execute(p.Context, conn)
 			return it, it.err
 		})
 		if err != nil {
