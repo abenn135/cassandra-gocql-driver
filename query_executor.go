@@ -82,11 +82,6 @@ const (
 	StatementBatch
 )
 
-type ImmutableQuery interface {
-	Statement() string
-	Values() []interface{}
-}
-
 type ExecAttempt struct {
 	// The statement type, whether query or batch.
 	Type StatementType
