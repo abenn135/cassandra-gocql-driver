@@ -970,8 +970,9 @@ type hostMetrics struct {
 }
 
 // Query attempts could be started and finished out of order when using speculative execution. Therefore,
-// we issue attempt indexes at query start time (so that Interceptors can use them) then record those attempts
-// at completion time (so that metrics can correctly express average latency).
+// we issue attempt indexes at query start time (so that Interceptors can use them) then track those attempts
+// at completion time. Later we can change latency metrics to correctly use the number completed to more accurately
+// track average latency.
 type queryMetrics struct {
 	l                 sync.RWMutex
 	attemptsStarted   int
@@ -987,21 +988,18 @@ func (qm *queryMetrics) getNextAttempt() int {
 	return attempt
 }
 
-func (qm *queryMetrics) recordAttempt(attempt int, addLatency time.Duration, s *Session) {
+func (qm *queryMetrics) recordAttempt(addLatency time.Duration) {
 	qm.l.Lock()
 	defer qm.l.Unlock()
 	qm.totalLatency += addLatency.Nanoseconds()
 	qm.attemptsCompleted++
-	if attempt > qm.attemptsCompleted && s != nil {
-		s.logger.Debug("attempt number is greater than total attempts completed, this should not happen", NewLogFieldInt("attempt", attempt), NewLogFieldInt("attemptsCompleted", qm.attemptsCompleted))
-	}
 }
 
-// Returns total number of attempts started.
+// Returns total number of attempts completed.
 func (qm *queryMetrics) attempts() int {
 	qm.l.RLock()
 	defer qm.l.RUnlock()
-	return qm.attemptsStarted
+	return qm.attemptsCompleted
 }
 
 func (qm *queryMetrics) latency() int64 {

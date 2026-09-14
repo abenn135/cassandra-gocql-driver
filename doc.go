@@ -815,12 +815,12 @@
 //
 // # Interceptors
 //
-// A ExecAttemptInterceptor wraps query/batch execution and can be used to inject logic that should apply to all query
+// A RequestInterceptor wraps query/batch execution and can be used to inject logic that should apply to all query
 // and batch execution attempts. For example, interceptors can be used for rate limiting, logging, attaching
 // distributed tracing metadata to the context, and inspecting query/batch results. However, the query/batch itself
 // cannot be modified.
 //
-// A ExecAttemptInterceptor will be invoked once prior to each query execution attempt, including retry attempts
+// A RequestInterceptor will be invoked once prior to each query execution attempt, including retry attempts
 // and speculative execution attempts. Interceptors are responsible for calling the provided handler and returning
 // a non-nil Iter or an error.
 //

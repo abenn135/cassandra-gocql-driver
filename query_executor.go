@@ -26,7 +26,6 @@ package gocql
 
 import (
 	"context"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,14 +72,14 @@ type internalRequest interface {
 type queryExecutor struct {
 	pool        *policyConnPool
 	policy      HostSelectionPolicy
-	interceptor ExecAttemptInterceptor
+	interceptor RequestInterceptor
 }
 
-type OpType int
+type StatementType int
 
 const (
-	OpQuery OpType = iota
-	OpBatch
+	StatementQuery StatementType = iota
+	StatementBatch
 )
 
 type ImmutableQuery interface {
@@ -88,134 +87,78 @@ type ImmutableQuery interface {
 	Values() []interface{}
 }
 
-type immutableQuery struct {
-	query *Query
-}
-
-func (q *immutableQuery) Statement() string {
-	return q.query.stmt
-}
-
-func (q *immutableQuery) Values() []interface{} {
-	return q.query.values
-}
-
-type ImmutableBatch interface {
-	Type() BatchType
-	Entries() []BatchEntry
-	Cons() Consistency
-}
-
-type immutableBatch struct {
-	batch *Batch
-}
-
-func (b *immutableBatch) Type() BatchType {
-	return b.batch.Type
-}
-
-func (b *immutableBatch) Entries() []BatchEntry {
-	return b.batch.Entries
-}
-
-func (b *immutableBatch) Cons() Consistency {
-	return b.batch.Cons
-}
-
-type QueryAttempt struct {
-	// The op type, whether query or batch.
-	Type OpType
-	// Only one of Query or Batch will be set, depending on the op type.
-	Query ImmutableQuery
-	Batch ImmutableBatch
+type ExecAttempt struct {
+	// The statement type, whether query or batch.
+	Type StatementType
+	// Only one of Query or Batch will be set, depending on the op type. Both should be considered
+	// immutable.
+	*Query
+	*Batch
 	// The host that will receive the query.
 	Host *HostInfo
-	// The local address of the connection used to execute the query.
-	LocalAddr net.Addr
-	// The remote address of the connection used to execute the query.
-	RemoteAddr net.Addr
-	// The number of this query attempt. 0 for the initial attempt, 1 for the first retry, etc. Note that there may be multiple serial Attempts to different hosts within a single execution, whether main execution or speculative.
-	Attempts int
-	// The index of the speculative execution attempt this attempt is associated with, starting with index 1. -1 indicates this is the "main" execution.
-	SpeculativeExecutionCount int
 }
 
-// QueryAttemptHandler is a function that attempts query execution. The interceptor must call this once if it does not return an error.
-type QueryAttemptHandler = func(context.Context) (*Iter, error)
-
-// ExecAttemptInterceptor is the interface implemented by interceptors / middleware.
+// RequestInterceptor is the interface implemented by interceptors / middleware.
 //
 // Interceptors are well-suited to logic that is not specific to a single query or batch, such as flow control.
-type ExecAttemptInterceptor interface {
+type RequestInterceptor interface {
 	// Intercept is invoked once immediately before a query or batch execution attempt, including retry attempts and
 	// speculative execution attempts.
 	//
-	// The interceptor is responsible for calling the `handler` function and returning the handler result. If the
-	// interceptor wants to bypass the handler and skip query execution, it should return an error. Failure to
-	// return either the handler result or an error will panic.
-	//
-	// Note that there is no affordance to mutate the query or batch at this stage -- the handler already encapsulates the original query/batch and cannot be modified.
-	Intercept(ctx context.Context, attempt QueryAttempt, handler QueryAttemptHandler) (*Iter, error)
+	// The method may inspect the ExecAttempt and its contents (e.g. Query/Batch, connection information, etc), along
+	// with the context ctx. To allow execution to proceed, it should return the passed-in context or one derived
+	// from it, perhaps by adding tags. To stop execution, return a non-nil error.
+	Intercept(ctx context.Context, attempt ExecAttempt) (context.Context, error)
 }
 
-// Use an ExecAttemptInterceptorChain to apply multiple Interceptors at Intercept time.
-type ExecAttemptInterceptorChain struct {
-	Interceptors []ExecAttemptInterceptor
+// Use a RequestInterceptorChain to apply multiple Interceptors at Intercept time.
+type RequestInterceptorChain struct {
+	Interceptors []RequestInterceptor
 }
 
-func (c ExecAttemptInterceptorChain) Intercept(
+func (c RequestInterceptorChain) Intercept(
 	ctx context.Context,
-	attempt QueryAttempt,
-	handler QueryAttemptHandler,
-) (*Iter, error) {
-	return c.Interceptors[0].Intercept(ctx, attempt, c.getNextHandler(0, attempt, handler))
+	attempt ExecAttempt,
+) (context.Context, error) {
+	for _, interceptor := range c.Interceptors {
+		var err error
+		ctx, err = interceptor.Intercept(ctx, attempt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return ctx, nil
 }
 
-func (c ExecAttemptInterceptorChain) getNextHandler(curr int, attempt QueryAttempt, final QueryAttemptHandler) QueryAttemptHandler {
-	if curr == len(c.Interceptors)-1 {
-		return final
-	}
-
-	return func(ctx context.Context) (*Iter, error) {
-		return c.Interceptors[curr+1].Intercept(ctx, attempt, c.getNextHandler(curr+1, attempt, final))
-	}
-}
-
-func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalRequest, conn *Conn, speculativeExecutionCount int) *Iter {
+func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalRequest, conn *Conn) *Iter {
 	start := time.Now()
 
 	var iter *Iter
 	var err error
 	attempt := iRequest.getNextAttempt()
+	defer func() {
+		end := time.Now()
+		iRequest.recordAttempt(attempt, q.pool.keyspace, end, start, iter, conn.host)
+	}()
 	if q.interceptor != nil {
-		iq := QueryAttempt{
-			Host:                      conn.host,
-			LocalAddr:                 conn.r.LocalAddr(),
-			RemoteAddr:                conn.r.RemoteAddr(),
-			Attempts:                  attempt,
-			SpeculativeExecutionCount: speculativeExecutionCount,
+		iq := ExecAttempt{
+			Host: conn.host,
 		}
 		if iQuery, ok := iRequest.(*internalQuery); ok {
-			iq.Type = OpQuery
-			iq.Query = &immutableQuery{query: iQuery.originalQuery}
+			iq.Type = StatementQuery
+			iq.Query = iQuery.originalQuery
 		}
 		if iBatch, ok := iRequest.(*internalBatch); ok {
-			iq.Type = OpBatch
-			iq.Batch = &immutableBatch{batch: iBatch.originalBatch}
+			iq.Type = StatementBatch
+			iq.Batch = iBatch.originalBatch
 		}
-		iter, err = q.interceptor.Intercept(ctx, iq, func(cxCtx context.Context) (*Iter, error) {
-			it := iRequest.execute(cxCtx, conn)
-			return it, it.err
-		})
+		ctx, err = q.interceptor.Intercept(ctx, iq)
 		if err != nil {
-			iter = &Iter{err: err}
+			iter = newErrIter(err, iRequest.getQueryMetrics(), iRequest.Keyspace(), iRequest.getRoutingInfo(), iRequest.getKeyspaceFunc())
+			return iter
 		}
-	} else {
-		iter = iRequest.execute(ctx, conn)
 	}
-
-	end := time.Now()
-	iRequest.recordAttempt(attempt, q.pool.keyspace, end, start, iter, conn.host)
+	iter = iRequest.execute(ctx, conn)
 
 	return iter
 }
@@ -228,7 +171,7 @@ func (q *queryExecutor) speculate(ctx context.Context, qry internalRequest, sp S
 	for i := 0; i < sp.Attempts(); i++ {
 		select {
 		case <-ticker.C:
-			go q.run(ctx, qry, hostIter, i+1, results)
+			go q.run(ctx, qry, hostIter, results)
 		case <-ctx.Done():
 			return newErrIter(ctx.Err(), qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 		case iter := <-results:
@@ -268,7 +211,7 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	// it is, we force the policy to NonSpeculative
 	sp := qry.speculativeExecutionPolicy()
 	if qry.GetHostID() != "" || !qry.IsIdempotent() || sp.Attempts() == 0 {
-		return q.do(qry.Context(), qry, hostIter, -1), nil
+		return q.do(qry.Context(), qry, hostIter), nil
 	}
 
 	// When speculative execution is enabled, we could be accessing the host iterator from multiple goroutines below.
@@ -287,7 +230,7 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	results := make(chan *Iter, 1)
 
 	// Launch the main execution
-	go q.run(ctx, qry, hostIter, -1, results)
+	go q.run(ctx, qry, hostIter, results)
 
 	// The speculative executions are launched _in addition_ to the main
 	// execution, on a timer. So Speculation{2} would make 3 executions running
@@ -304,7 +247,7 @@ func (q *queryExecutor) executeQuery(qry internalRequest) (*Iter, error) {
 	}
 }
 
-func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost, speculativeExecutionCount int) *Iter {
+func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter NextHost) *Iter {
 	selectedHost := hostIter()
 	rt := qry.retryPolicy()
 
@@ -329,7 +272,7 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 			continue
 		}
 
-		iter = q.attemptQuery(ctx, qry, conn, speculativeExecutionCount)
+		iter = q.attemptQuery(ctx, qry, conn)
 		iter.host = selectedHost.Info()
 		// Update host
 		switch iter.err {
@@ -385,9 +328,9 @@ func (q *queryExecutor) do(ctx context.Context, qry internalRequest, hostIter Ne
 	return newErrIter(ErrNoConnections, qry.getQueryMetrics(), qry.Keyspace(), qry.getRoutingInfo(), qry.getKeyspaceFunc())
 }
 
-func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, speculativeExecutionCount int, results chan<- *Iter) {
+func (q *queryExecutor) run(ctx context.Context, qry internalRequest, hostIter NextHost, results chan<- *Iter) {
 	select {
-	case results <- q.do(ctx, qry, hostIter, speculativeExecutionCount):
+	case results <- q.do(ctx, qry, hostIter):
 	case <-ctx.Done():
 	}
 }
@@ -519,7 +462,7 @@ func (q *internalQuery) Attempts() int {
 
 func (q *internalQuery) recordAttempt(attemptNum int, keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
 	latency := end.Sub(start)
-	q.metrics.recordAttempt(attemptNum, latency, q.session)
+	q.metrics.recordAttempt(latency)
 
 	if q.qryOpts.observer != nil {
 		metricsForHost := q.hostMetricsManager.attempt(latency, host)
@@ -753,7 +696,7 @@ func (b *internalBatch) Attempts() int {
 
 func (b *internalBatch) recordAttempt(attemptNum int, keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
 	latency := end.Sub(start)
-	b.metrics.recordAttempt(attemptNum, latency, b.session)
+	b.metrics.recordAttempt(latency)
 
 	if b.batchOpts.observer == nil {
 		return

@@ -260,7 +260,7 @@ type ClusterConfig struct {
 
 	// ExecAttemptInterceptor will set the provided interceptor on all queries/batches created from this session.
 	// Use it to intercept queries by providing an implementation of ExecAttemptInterceptor.
-	ExecAttemptInterceptor ExecAttemptInterceptor
+	ExecAttemptInterceptor RequestInterceptor
 
 	// QueryObserver will set the provided query observer on all queries created from this session.
 	// Use it to collect metrics / stats from queries by providing an implementation of QueryObserver.
