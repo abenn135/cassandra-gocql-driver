@@ -38,10 +38,10 @@ type MyRequestInterceptor struct {
 
 var _ gocql.RequestInterceptor = (*MyRequestInterceptor)(nil)
 
-func (q MyRequestInterceptor) Intercept(
+func (q MyRequestInterceptor) InterceptPreAttempt(
 	ctx context.Context,
 	attempt gocql.ExecAttempt,
-) (context.Context, error) {
+) (gocql.InterceptResult, error) {
 	switch attempt.Type {
 	case gocql.StatementQuery:
 		// Inspect query
@@ -58,11 +58,15 @@ func (q MyRequestInterceptor) Intercept(
 	// For example, to simulate query timeouts.
 	if q.injectFault {
 		<-time.After(1 * time.Second)
-		return nil, gocql.RequestErrWriteTimeout{}
+		return gocql.InterceptResult{}, gocql.RequestErrWriteTimeout{}
 	}
 
 	// The interceptor *must* invoke the handler to execute the query.
-	return ctx, nil
+	return gocql.InterceptResult{Ctx: ctx}, nil
+}
+
+func (q MyRequestInterceptor) InterceptPostAttempt(_ gocql.InterceptResult, _ error) {
+	// Pass.
 }
 
 // Example_interceptor demonstrates how to implement a RequestInterceptor.

@@ -93,17 +93,26 @@ type ExecAttempt struct {
 	Host *HostInfo
 }
 
+type InterceptResult struct {
+	Ctx      context.Context
+	Metadata any
+}
+
 // RequestInterceptor is the interface implemented by interceptors / middleware.
 //
 // Interceptors are well-suited to logic that is not specific to a single query or batch, such as flow control.
 type RequestInterceptor interface {
-	// Intercept is invoked once immediately before a query or batch execution attempt, including retry attempts and
+	// InterceptPreAttempt is invoked once immediately before a query or batch execution attempt, including retry attempts and
 	// speculative execution attempts.
 	//
 	// The method may inspect the ExecAttempt and its contents (e.g. Query/Batch, connection information, etc), along
-	// with the context ctx. To allow execution to proceed, it should return the passed-in context or one derived
-	// from it, perhaps by adding tags. To stop execution, return a non-nil error.
-	Intercept(ctx context.Context, attempt ExecAttempt) (context.Context, error)
+	// with the context ctx. If a ctx is specified in the returned InterceptResult, it is used when performing the
+	// execution; the metadata field can be used to pass information to the post-attempt processing. To stop execution,
+	// return a non-nil error.
+	InterceptPreAttempt(ctx context.Context, attempt ExecAttempt) (InterceptResult, error)
+
+	// This is called with the intercept result created at pre-attempt time, along with any execution error.
+	InterceptPostAttempt(res InterceptResult, execResult error)
 }
 
 // Use a RequestInterceptorChain to apply multiple Interceptors at Intercept time.
@@ -111,18 +120,32 @@ type RequestInterceptorChain struct {
 	Interceptors []RequestInterceptor
 }
 
-func (c RequestInterceptorChain) Intercept(
+var _ RequestInterceptor = (*RequestInterceptorChain)(nil)
+
+func (c RequestInterceptorChain) InterceptPreAttempt(
 	ctx context.Context,
 	attempt ExecAttempt,
-) (context.Context, error) {
+) (InterceptResult, error) {
+	nextCtx := ctx
+	result := InterceptResult{}
 	for _, interceptor := range c.Interceptors {
 		var err error
-		ctx, err = interceptor.Intercept(ctx, attempt)
+		result, err = interceptor.InterceptPreAttempt(nextCtx, attempt)
 		if err != nil {
-			return nil, err
+			return InterceptResult{}, err
 		}
+		nextCtx = result.Ctx
 	}
-	return ctx, nil
+	// Returns the last chained InterceptResult.
+	return result, nil
+}
+
+func (c RequestInterceptorChain) InterceptPostAttempt(
+	res InterceptResult, execResult error,
+) {
+	for _, interceptor := range c.Interceptors {
+		interceptor.InterceptPostAttempt(res, execResult)
+	}
 }
 
 func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalRequest, conn *Conn) *Iter {
@@ -135,6 +158,7 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalReque
 		end := time.Now()
 		iRequest.recordAttempt(attempt, q.pool.keyspace, end, start, iter, conn.host)
 	}()
+	var res InterceptResult
 	if q.interceptor != nil {
 		iq := ExecAttempt{
 			Host: conn.host,
@@ -147,13 +171,18 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, iRequest internalReque
 			iq.Type = StatementBatch
 			iq.Batch = iBatch.originalBatch
 		}
-		ctx, err = q.interceptor.Intercept(ctx, iq)
+		res, err = q.interceptor.InterceptPreAttempt(ctx, iq)
 		if err != nil {
 			iter = newErrIter(err, iRequest.getQueryMetrics(), iRequest.Keyspace(), iRequest.getRoutingInfo(), iRequest.getKeyspaceFunc())
 			return iter
+		} else {
+			ctx = res.Ctx
 		}
 	}
 	iter = iRequest.execute(ctx, conn)
+	if q.interceptor != nil {
+		q.interceptor.InterceptPostAttempt(res, iter.err)
+	}
 
 	return iter
 }
